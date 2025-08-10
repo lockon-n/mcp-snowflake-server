@@ -76,8 +76,12 @@ class SnowflakeDB:
 
         logger.debug(f"Executing query: {query}")
         try:
-            result = self.session.sql(query).to_pandas()
-            result_rows = result.to_dict(orient="records")
+            result = self.session.sql(query).collect()
+            
+            if result:
+                result_rows = [row.asDict() for row in result]
+            else:
+                result_rows = [{"status": "success", "message": "Query executed successfully"}]
             data_id = str(uuid.uuid4())
 
             return result_rows, data_id
