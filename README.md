@@ -130,16 +130,6 @@ The server exposes the following tools:
 
 ## Usage with Claude Desktop
 
-### Installing via Smithery
-
-To install Snowflake Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/mcp_snowflake_server):
-
-```bash
-npx -y @smithery/cli install mcp_snowflake_server --client claude
-```
-
----
-
 ### Installing Locally
 
 1. Install [Claude AI Desktop App](https://claude.ai/download)
