@@ -130,6 +130,34 @@ The server exposes the following tools:
 
 ## Usage with Claude Desktop
 
+### uvx
+
+*Note: please edit and change these parameters on your own need.
+
+```json
+"mcpServers": {
+  "snowflake": {
+    "command": "uvx",
+    "args": [
+      "git+https://github.com/lockon-n/mcp-snowflake-server"
+      "--account your-account-id"
+      "--warehouse COMPUTE_WH"
+      "--user your-user-name"
+      "--password your-password"
+      "--role ACCOUNTADMIN"
+      "--database SNOWFLAKE"
+      "--schema PUBLIC"
+      "--allowed_databases db1,db2,db3" (optionl)
+      "--allow_write" (optional)
+      "--exclude-json-results" (optionl)
+      // Optionally: "--log_dir", "/absolute/path/to/logs"
+      // Optionally: "--log_level", "DEBUG"/"INFO"/"WARNING"/"ERROR"/"CRITICAL"
+      // Optionally: "--exclude_tools", "{tool_name}", ["{other_tool_name}"]
+    ]
+  }
+}
+```
+
 ### Installing Locally
 
 1. Install [Claude AI Desktop App](https://claude.ai/download)
