@@ -41,6 +41,43 @@ def handle_tool_errors(func: Callable) -> Callable:
     return wrapper
 
 
+def check_database_access(database_name: str, allowed_databases: list[str] | None = None) -> None:
+    """Check if database access is allowed based on allowed_databases restriction"""
+    if allowed_databases is not None:
+        if database_name not in allowed_databases:
+            raise ValueError(f"Access denied: Database '{database_name}' is not in the allowed databases list: {allowed_databases}")
+
+
+def extract_database_from_query(query: str) -> str | None:
+    """Extract database name from SQL query using basic parsing"""
+    # Convert to uppercase for easier matching
+    query_upper = query.upper().strip()
+    
+    # For CREATE/DROP DATABASE commands
+    if "CREATE DATABASE" in query_upper or "DROP DATABASE" in query_upper:
+        tokens = query_upper.split()
+        try:
+            db_index = tokens.index("DATABASE") + 1
+            if db_index < len(tokens):
+                return tokens[db_index].strip(';')
+        except (ValueError, IndexError):
+            pass
+    
+    # For USE DATABASE commands
+    if query_upper.startswith("USE"):
+        tokens = query_upper.split()
+        if len(tokens) >= 2:
+            return tokens[1].strip(';')
+    
+    # For qualified table references like database.schema.table
+    import re
+    qualified_match = re.search(r'\b([A-Z_][A-Z0-9_]*)\.[A-Z_][A-Z0-9_]*\.[A-Z_][A-Z0-9_]*', query_upper)
+    if qualified_match:
+        return qualified_match.group(1)
+    
+    return None
+
+
 class Tool(BaseModel):
     name: str
     description: str
@@ -50,9 +87,14 @@ class Tool(BaseModel):
 
 
 # Tool handlers
-async def handle_list_databases(arguments, db, *_, exclusion_config=None, exclude_json_results=False):
+async def handle_list_databases(arguments, db, *_, exclusion_config=None, exclude_json_results=False, allowed_databases=None, **__):
     query = "SELECT DATABASE_NAME FROM INFORMATION_SCHEMA.DATABASES"
     data, data_id = await db.execute_query(query)
+
+    # Filter to only allowed databases if restriction is set
+    if allowed_databases is not None:
+        allowed_db_set = {db.upper() for db in allowed_databases}
+        data = [item for item in data if item.get("DATABASE_NAME", "").upper() in allowed_db_set]
 
     # Filter out excluded databases
     if exclusion_config and "databases" in exclusion_config and exclusion_config["databases"]:
@@ -81,18 +123,21 @@ async def handle_list_databases(arguments, db, *_, exclusion_config=None, exclud
             types.EmbeddedResource(
                 type="resource",
                 resource=types.TextResourceContents(
-                    uri=f"data://{data_id}", text=json_output, mimeType="application/json"
+                    uri=AnyUrl(f"data://{data_id}"), text=json_output, mimeType="application/json"
                 ),
             )
         )
     return results
 
 
-async def handle_list_schemas(arguments, db, *_, exclusion_config=None, exclude_json_results=False):
+async def handle_list_schemas(arguments, db, *_, exclusion_config=None, exclude_json_results=False, allowed_databases=None, **__):
     if not arguments or "database" not in arguments:
         raise ValueError("Missing required 'database' parameter")
 
     database = arguments["database"]
+    
+    # Check allowed databases restriction
+    check_database_access(database, allowed_databases)
     query = f"SELECT SCHEMA_NAME FROM {database.upper()}.INFORMATION_SCHEMA.SCHEMATA"
     data, data_id = await db.execute_query(query)
 
@@ -124,19 +169,22 @@ async def handle_list_schemas(arguments, db, *_, exclusion_config=None, exclude_
             types.EmbeddedResource(
                 type="resource",
                 resource=types.TextResourceContents(
-                    uri=f"data://{data_id}", text=json_output, mimeType="application/json"
+                    uri=AnyUrl(f"data://{data_id}"), text=json_output, mimeType="application/json"
                 ),
             )
         )
     return results
 
 
-async def handle_list_tables(arguments, db, *_, exclusion_config=None, exclude_json_results=False):
+async def handle_list_tables(arguments, db, *_, exclusion_config=None, exclude_json_results=False, allowed_databases=None, **__):
     if not arguments or "database" not in arguments or "schema" not in arguments:
         raise ValueError("Missing required 'database' and 'schema' parameters")
 
     database = arguments["database"]
     schema = arguments["schema"]
+    
+    # Check allowed databases restriction
+    check_database_access(database, allowed_databases)
 
     query = f"""
         SELECT table_catalog, table_schema, table_name, comment 
@@ -174,14 +222,14 @@ async def handle_list_tables(arguments, db, *_, exclusion_config=None, exclude_j
             types.EmbeddedResource(
                 type="resource",
                 resource=types.TextResourceContents(
-                    uri=f"data://{data_id}", text=json_output, mimeType="application/json"
+                    uri=AnyUrl(f"data://{data_id}"), text=json_output, mimeType="application/json"
                 ),
             )
         )
     return results
 
 
-async def handle_describe_table(arguments, db, *_, exclude_json_results=False):
+async def handle_describe_table(arguments, db, *_, exclude_json_results=False, allowed_databases=None, **__):
     if not arguments or "table_name" not in arguments:
         raise ValueError("Missing table_name argument")
 
@@ -193,6 +241,9 @@ async def handle_describe_table(arguments, db, *_, exclude_json_results=False):
         raise ValueError("Table name must be fully qualified as 'database.schema.table'")
 
     database_name = split_identifier[0].upper()
+    
+    # Check allowed databases restriction
+    check_database_access(database_name, allowed_databases)
     schema_name = split_identifier[1].upper()
     table_name = split_identifier[2].upper()
 
@@ -219,19 +270,25 @@ async def handle_describe_table(arguments, db, *_, exclude_json_results=False):
             types.EmbeddedResource(
                 type="resource",
                 resource=types.TextResourceContents(
-                    uri=f"data://{data_id}", text=json_output, mimeType="application/json"
+                    uri=AnyUrl(f"data://{data_id}"), text=json_output, mimeType="application/json"
                 ),
             )
         )
     return results
 
 
-async def handle_read_query(arguments, db, write_detector, *_, exclude_json_results=False):
+async def handle_read_query(arguments, db, write_detector, *_, exclude_json_results=False, allowed_databases=None, **__):
     if not arguments or "query" not in arguments:
         raise ValueError("Missing query argument")
 
     if write_detector.analyze_query(arguments["query"])["contains_write"]:
         raise ValueError("Calls to read_query should not contain write operations")
+    
+    # Check database access if allowed_databases is specified
+    if allowed_databases is not None:
+        extracted_db = extract_database_from_query(arguments["query"])
+        if extracted_db:
+            check_database_access(extracted_db, allowed_databases)
 
     data, data_id = await db.execute_query(arguments["query"])
 
@@ -248,7 +305,7 @@ async def handle_read_query(arguments, db, write_detector, *_, exclude_json_resu
             types.EmbeddedResource(
                 type="resource",
                 resource=types.TextResourceContents(
-                    uri=f"data://{data_id}", text=json_output, mimeType="application/json"
+                    uri=AnyUrl(f"data://{data_id}"), text=json_output, mimeType="application/json"
                 ),
             )
         )
@@ -264,14 +321,300 @@ async def handle_append_insight(arguments, db, _, __, server, exclude_json_resul
     return [types.TextContent(type="text", text="Insight added to memo")]
 
 
-async def handle_write_query(arguments, db, _, allow_write, __, **___):
+async def handle_write_query(arguments, db, _, allow_write, __, allowed_databases=None, **___):
     if not allow_write:
         raise ValueError("Write operations are not allowed for this data connection")
     if arguments["query"].strip().upper().startswith("SELECT"):
         raise ValueError("SELECT queries are not allowed for write_query")
 
+    # Check database access if allowed_databases is specified
+    if allowed_databases is not None:
+        extracted_db = extract_database_from_query(arguments["query"])
+        if extracted_db:
+            check_database_access(extracted_db, allowed_databases)
+
     results, data_id = await db.execute_query(arguments["query"])
     return [types.TextContent(type="text", text=str(results))]
+
+
+async def handle_create_databases(arguments, db, _, allow_write, __, allowed_databases=None, **___):
+    if not allow_write:
+        raise ValueError("Write operations are not allowed for this data connection")
+    if not arguments or "databases" not in arguments:
+        raise ValueError("Missing required 'databases' parameter")
+    
+    database_names = arguments["databases"]
+    if not isinstance(database_names, list):
+        raise ValueError("'databases' parameter must be a list of database names")
+    
+    results = []
+    warnings = []
+    
+    # Check allowed databases restriction for all databases first
+    real_database_names = []
+    for db_name in database_names:
+        try:
+            check_database_access(db_name, allowed_databases)
+            real_database_names.append(db_name)
+        except Exception as e:
+            warnings.append(f"Warning: Creating database '{db_name}' is not allowed, you can only create databases in the following list: {allowed_databases}")
+    
+    # Get existing databases to check for duplicates
+    existing_dbs_result, _ = await db.execute_query("SELECT DATABASE_NAME FROM INFORMATION_SCHEMA.DATABASES")
+    existing_db_names = {row["DATABASE_NAME"].upper() for row in existing_dbs_result}
+    
+    for db_name in real_database_names:
+        db_name_upper = db_name.upper()
+        if db_name_upper in existing_db_names:
+            warnings.append(f"Warning: Database '{db_name}' already exists, skipping creation")
+        else:
+            try:
+                create_result, _ = await db.execute_query(f"CREATE DATABASE {db_name}")
+                results.append(f"Successfully created database '{db_name}'")
+            except Exception as e:
+                results.append(f"Failed to create database '{db_name}': {str(e)}")
+    
+    response_text = "\n".join(results)
+    if warnings:
+        response_text = "\n".join(warnings) + "\n" + response_text
+    
+    return [types.TextContent(type="text", text=response_text)]
+
+
+async def handle_drop_databases(arguments, db, _, allow_write, __, allowed_databases=None, **___):
+    if not allow_write:
+        raise ValueError("Write operations are not allowed for this data connection")
+    if not arguments or "databases" not in arguments:
+        raise ValueError("Missing required 'databases' parameter")
+    
+    database_names = arguments["databases"]
+    if not isinstance(database_names, list):
+        raise ValueError("'databases' parameter must be a list of database names")
+    
+    results = []
+    warnings = []
+    
+    # Check allowed databases restriction for all databases first
+    for db_name in database_names:
+        check_database_access(db_name, allowed_databases)
+    
+    # Get existing databases to check for non-existent ones
+    existing_dbs_result, _ = await db.execute_query("SELECT DATABASE_NAME FROM INFORMATION_SCHEMA.DATABASES")
+    existing_db_names = {row["DATABASE_NAME"].upper() for row in existing_dbs_result}
+    
+    for db_name in database_names:
+        db_name_upper = db_name.upper()
+        if db_name_upper not in existing_db_names:
+            warnings.append(f"Warning: Database '{db_name}' does not exist, skipping deletion")
+        else:
+            try:
+                drop_result, _ = await db.execute_query(f"DROP DATABASE {db_name}")
+                results.append(f"Successfully dropped database '{db_name}'")
+            except Exception as e:
+                results.append(f"Failed to drop database '{db_name}': {str(e)}")
+    
+    response_text = "\n".join(results)
+    if warnings:
+        response_text = "\n".join(warnings) + "\n" + response_text
+    
+    return [types.TextContent(type="text", text=response_text)]
+
+
+async def handle_create_schemas(arguments, db, _, allow_write, __, allowed_databases=None, **___):
+    if not allow_write:
+        raise ValueError("Write operations are not allowed for this data connection")
+    if not arguments or "database" not in arguments or "schemas" not in arguments:
+        raise ValueError("Missing required 'database' and 'schemas' parameters")
+    
+    database_name = arguments["database"]
+    schema_names = arguments["schemas"]
+    
+    if not isinstance(schema_names, list):
+        raise ValueError("'schemas' parameter must be a list of schema names")
+    
+    # Check allowed databases restriction
+    check_database_access(database_name, allowed_databases)
+    
+    results = []
+    warnings = []
+    
+    # Get existing schemas to check for duplicates
+    try:
+        existing_schemas_result, _ = await db.execute_query(f"SELECT SCHEMA_NAME FROM {database_name}.INFORMATION_SCHEMA.SCHEMATA")
+        existing_schema_names = {row["SCHEMA_NAME"].upper() for row in existing_schemas_result}
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Failed to check existing schemas in database '{database_name}': {str(e)}")]
+    
+    for schema_name in schema_names:
+        schema_name_upper = schema_name.upper()
+        if schema_name_upper in existing_schema_names:
+            warnings.append(f"Warning: Schema '{schema_name}' already exists in database '{database_name}', skipping creation")
+        else:
+            try:
+                create_result, _ = await db.execute_query(f"CREATE SCHEMA {database_name}.{schema_name}")
+                results.append(f"Successfully created schema '{schema_name}' in database '{database_name}'")
+            except Exception as e:
+                results.append(f"Failed to create schema '{schema_name}' in database '{database_name}': {str(e)}")
+    
+    response_text = "\n".join(results)
+    if warnings:
+        response_text = "\n".join(warnings) + "\n" + response_text
+    
+    return [types.TextContent(type="text", text=response_text)]
+
+
+async def handle_drop_schemas(arguments, db, _, allow_write, __, allowed_databases=None, **___):
+    if not allow_write:
+        raise ValueError("Write operations are not allowed for this data connection")
+    if not arguments or "database" not in arguments or "schemas" not in arguments:
+        raise ValueError("Missing required 'database' and 'schemas' parameters")
+    
+    database_name = arguments["database"]
+    schema_names = arguments["schemas"]
+    
+    if not isinstance(schema_names, list):
+        raise ValueError("'schemas' parameter must be a list of schema names")
+    
+    # Check allowed databases restriction
+    check_database_access(database_name, allowed_databases)
+    
+    results = []
+    warnings = []
+    
+    # Get existing schemas to check for non-existent ones
+    try:
+        existing_schemas_result, _ = await db.execute_query(f"SELECT SCHEMA_NAME FROM {database_name}.INFORMATION_SCHEMA.SCHEMATA")
+        existing_schema_names = {row["SCHEMA_NAME"].upper() for row in existing_schemas_result}
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Failed to check existing schemas in database '{database_name}': {str(e)}")]
+    
+    for schema_name in schema_names:
+        schema_name_upper = schema_name.upper()
+        if schema_name_upper not in existing_schema_names:
+            warnings.append(f"Warning: Schema '{schema_name}' does not exist in database '{database_name}', skipping deletion")
+        else:
+            try:
+                drop_result, _ = await db.execute_query(f"DROP SCHEMA {database_name}.{schema_name}")
+                results.append(f"Successfully dropped schema '{schema_name}' from database '{database_name}'")
+            except Exception as e:
+                results.append(f"Failed to drop schema '{schema_name}' from database '{database_name}': {str(e)}")
+    
+    response_text = "\n".join(results)
+    if warnings:
+        response_text = "\n".join(warnings) + "\n" + response_text
+    
+    return [types.TextContent(type="text", text=response_text)]
+
+
+async def handle_create_tables(arguments, db, _, allow_write, __, allowed_databases=None, **___):
+    if not allow_write:
+        raise ValueError("Write operations are not allowed for this data connection")
+    if not arguments or "database" not in arguments or "schema" not in arguments or "tables" not in arguments:
+        raise ValueError("Missing required 'database', 'schema', and 'tables' parameters")
+    
+    database_name = arguments["database"]
+    schema_name = arguments["schema"]
+    table_definitions = arguments["tables"]
+    
+    if not isinstance(table_definitions, list):
+        raise ValueError("'tables' parameter must be a list of table definitions")
+    
+    # Check allowed databases restriction
+    check_database_access(database_name, allowed_databases)
+    
+    results = []
+    warnings = []
+    
+    # Get existing tables to check for duplicates
+    try:
+        existing_tables_result, _ = await db.execute_query(
+            f"SELECT TABLE_NAME FROM {database_name}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{schema_name.upper()}'"
+        )
+        existing_table_names = {row["TABLE_NAME"].upper() for row in existing_tables_result}
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Failed to check existing tables in {database_name}.{schema_name}: {str(e)}")]
+    
+    for table_def in table_definitions:
+        if isinstance(table_def, dict) and "name" in table_def and "definition" in table_def:
+            table_name = table_def["name"]
+            table_definition = table_def["definition"]
+        elif isinstance(table_def, str):
+            # Simple format: just the CREATE TABLE SQL
+            table_definition = table_def
+            # Try to extract table name from SQL
+            import re
+            match = re.search(r'CREATE\s+TABLE\s+(\w+)', table_definition.upper())
+            table_name = match.group(1) if match else "UNKNOWN"
+        else:
+            results.append(f"Invalid table definition format: {table_def}")
+            continue
+            
+        table_name_upper = table_name.upper()
+        if table_name_upper in existing_table_names:
+            warnings.append(f"Warning: Table '{table_name}' already exists in {database_name}.{schema_name}, skipping creation")
+        else:
+            try:
+                # Ensure the table is created in the correct database.schema
+                full_table_definition = table_definition.replace(
+                    f"CREATE TABLE {table_name}", 
+                    f"CREATE TABLE {database_name}.{schema_name}.{table_name}"
+                )
+                create_result, _ = await db.execute_query(full_table_definition)
+                results.append(f"Successfully created table '{table_name}' in {database_name}.{schema_name}")
+            except Exception as e:
+                results.append(f"Failed to create table '{table_name}' in {database_name}.{schema_name}: {str(e)}")
+    
+    response_text = "\n".join(results)
+    if warnings:
+        response_text = "\n".join(warnings) + "\n" + response_text
+    
+    return [types.TextContent(type="text", text=response_text)]
+
+
+async def handle_drop_tables(arguments, db, _, allow_write, __, allowed_databases=None, **___):
+    if not allow_write:
+        raise ValueError("Write operations are not allowed for this data connection")
+    if not arguments or "database" not in arguments or "schema" not in arguments or "tables" not in arguments:
+        raise ValueError("Missing required 'database', 'schema', and 'tables' parameters")
+    
+    database_name = arguments["database"]
+    schema_name = arguments["schema"]
+    table_names = arguments["tables"]
+    
+    if not isinstance(table_names, list):
+        raise ValueError("'tables' parameter must be a list of table names")
+    
+    # Check allowed databases restriction
+    check_database_access(database_name, allowed_databases)
+    
+    results = []
+    warnings = []
+    
+    # Get existing tables to check for non-existent ones
+    try:
+        existing_tables_result, _ = await db.execute_query(
+            f"SELECT TABLE_NAME FROM {database_name}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{schema_name.upper()}'"
+        )
+        existing_table_names = {row["TABLE_NAME"].upper() for row in existing_tables_result}
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Failed to check existing tables in {database_name}.{schema_name}: {str(e)}")]
+    
+    for table_name in table_names:
+        table_name_upper = table_name.upper()
+        if table_name_upper not in existing_table_names:
+            warnings.append(f"Warning: Table '{table_name}' does not exist in {database_name}.{schema_name}, skipping deletion")
+        else:
+            try:
+                drop_result, _ = await db.execute_query(f"DROP TABLE {database_name}.{schema_name}.{table_name}")
+                results.append(f"Successfully dropped table '{table_name}' from {database_name}.{schema_name}")
+            except Exception as e:
+                results.append(f"Failed to drop table '{table_name}' from {database_name}.{schema_name}: {str(e)}")
+    
+    response_text = "\n".join(results)
+    if warnings:
+        response_text = "\n".join(warnings) + "\n" + response_text
+    
+    return [types.TextContent(type="text", text=response_text)]
 
 
 async def handle_create_table(arguments, db, _, allow_write, __, **___):
@@ -326,6 +669,7 @@ async def main(
     config_file: str = "runtime_config.json",
     exclude_patterns: dict = None,
     exclude_json_results: bool = False,
+    allowed_databases: list[str] = None,
 ):
     # Setup logging
     if log_dir:
@@ -480,6 +824,144 @@ async def main(
             handler=handle_create_table,
             tags=["write"],
         ),
+        Tool(
+            name="create_databases",
+            description="Create multiple databases in Snowflake",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "databases": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of database names to create"
+                    }
+                },
+                "required": ["databases"],
+            },
+            handler=handle_create_databases,
+            tags=["write"],
+        ),
+        Tool(
+            name="drop_databases",
+            description="Drop multiple databases in Snowflake",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "databases": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of database names to drop"
+                    }
+                },
+                "required": ["databases"],
+            },
+            handler=handle_drop_databases,
+            tags=["write"],
+        ),
+        Tool(
+            name="create_schemas",
+            description="Create multiple schemas in a database",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Database name where schemas will be created"
+                    },
+                    "schemas": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of schema names to create"
+                    }
+                },
+                "required": ["database", "schemas"],
+            },
+            handler=handle_create_schemas,
+            tags=["write"],
+        ),
+        Tool(
+            name="drop_schemas",
+            description="Drop multiple schemas from a database",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Database name where schemas will be dropped"
+                    },
+                    "schemas": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of schema names to drop"
+                    }
+                },
+                "required": ["database", "schemas"],
+            },
+            handler=handle_drop_schemas,
+            tags=["write"],
+        ),
+        Tool(
+            name="create_tables",
+            description="Create multiple tables in a database schema",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Database name"
+                    },
+                    "schema": {
+                        "type": "string",
+                        "description": "Schema name"
+                    },
+                    "tables": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                {"type": "string", "description": "CREATE TABLE SQL statement"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string", "description": "Table name"},
+                                        "definition": {"type": "string", "description": "CREATE TABLE SQL statement"}
+                                    },
+                                    "required": ["name", "definition"]
+                                }
+                            ]
+                        },
+                        "description": "List of table definitions to create"
+                    }
+                },
+                "required": ["database", "schema", "tables"],
+            },
+            handler=handle_create_tables,
+            tags=["write"],
+        ),
+        Tool(
+            name="drop_tables",
+            description="Drop multiple tables from a database schema",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Database name"
+                    },
+                    "schema": {
+                        "type": "string",
+                        "description": "Schema name"
+                    },
+                    "tables": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of table names to drop"
+                    }
+                },
+                "required": ["database", "schema", "tables"],
+            },
+            handler=handle_drop_tables,
+            tags=["write"],
+        ),
     ]
 
     exclude_tags = []
@@ -555,6 +1037,7 @@ async def main(
                 server,
                 exclusion_config=exclusion_config,
                 exclude_json_results=exclude_json_results,
+                allowed_databases=allowed_databases,
             )
         else:
             return await handler(
@@ -564,6 +1047,7 @@ async def main(
                 allow_write,
                 server,
                 exclude_json_results=exclude_json_results,
+                allowed_databases=allowed_databases,
             )
 
     @server.list_tools()

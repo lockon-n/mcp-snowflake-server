@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import os
 import sys
+import logging
 
 import dotenv
 import snowflake.connector
@@ -85,6 +86,12 @@ def parse_args():
     )
     
     parser.add_argument(
+        "--allowed_databases",
+        required=False,
+        help="Comma-separated list of databases that operations are restricted to",
+    )
+    
+    parser.add_argument(
         "--private_key_path",
         required=False,
         help="Path to private key file for authentication",
@@ -123,6 +130,12 @@ def parse_args():
             key = key[2:]  # Remove the '--'
             connection_args[key] = value
 
+    # Parse allowed databases
+    allowed_databases = None
+    if args.allowed_databases:
+        allowed_databases = [db.strip() for db in args.allowed_databases.split(',')]
+        logging.warning(f"Allowed databases: {allowed_databases}")
+
     # Now we can add the known args to kwargs
     server_args = {
         "allow_write": args.allow_write,
@@ -133,6 +146,7 @@ def parse_args():
         "exclude_json_results": args.exclude_json_results,
         "connection_name": getattr(args, 'connection_name', None),
         "connections_file": getattr(args, 'connections_file', None),
+        "allowed_databases": allowed_databases,
     }
 
     # Add private_key_path if provided
@@ -198,6 +212,7 @@ def main():
             log_level=server_args["log_level"],
             exclude_tools=server_args["exclude_tools"],
             exclude_json_results=server_args["exclude_json_results"],
+            allowed_databases=server_args["allowed_databases"],
         )
     )
 
